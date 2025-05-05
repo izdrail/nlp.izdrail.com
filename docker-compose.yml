@@ -1,0 +1,11 @@
+services:
+  nlp.izdrail.com:
+    build:
+      context: .
+    container_name: nlp.izdrail.com
+    image: izdrail/nlp.izdrail.com:latest
+    restart: always
+    ports:
+      - "1099:1099"   # Backend service port
+    volumes:
+      - .:/home/trending/
