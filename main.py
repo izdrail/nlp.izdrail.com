@@ -443,3 +443,9 @@ async def update_article_cache(url: str, cache_key: str):
         logger.info(f"Cache updated for {url}")
     except Exception as e:
         logger.error(f"Error updating cache for {url}: {str(e)}")
+
+
+# If this module is run directly, start the app with uvicorn
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=1098, reload=True)
