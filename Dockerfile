@@ -66,7 +66,7 @@ RUN updatedb
 
 
 # Expose application port
-EXPOSE 1099
+EXPOSE 1098
 
 
 

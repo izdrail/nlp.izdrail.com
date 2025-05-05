@@ -6,6 +6,6 @@ services:
     image: izdrail/nlp.izdrail.com:latest
     restart: always
     ports:
-      - "1099:1099"   # Backend service port
+      - "1098:1098"   # Backend service port
     volumes:
       - .:/home/trending/

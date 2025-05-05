@@ -1,4 +1,3 @@
-# Trending
+# NLP
 
-
-Trending is a fast api for detecting trends in data.
+This is my nlp project
