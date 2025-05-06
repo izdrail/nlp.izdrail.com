@@ -1,10 +1,19 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Query, status
-from pydantic import BaseModel, Field, validator, HttpUrl
-from typing import List, Dict, Any, Optional, Union
+from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks, Depends, Query, status
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator, HttpUrl, ConfigDict
+from typing import List, Dict, Any, Optional, Union, Annotated
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import time
 from datetime import datetime
+import hashlib
+import re
+import html
+from functools import lru_cache
+
+# NLP Libraries
 import spacy
 from newspaper import Article, Config
 from markdownify import markdownify as md
@@ -14,11 +23,6 @@ import socials
 import socid_extractor
 import socialshares
 from spacy import displacy
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import hashlib
-import re
-import html
 
 # Configure logging
 logging.basicConfig(
@@ -27,18 +31,154 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nlp_api")
 
-# Initialize FastAPI Router with more detailed description
-app = APIRouter(
-    prefix="/api/v1",
-    tags=["nlp"],
-    
-)
+# Constants
+EXCLUDED_ENTITY_TYPES = {"TIME", "DATE", "LANGUAGE", "PERCENT", "MONEY", "QUANTITY", "ORDINAL", "CARDINAL"}
+STRIP_TEXT_RULES = ["a"]
+DEFAULT_USER_AGENT = "NLP/1.0.0 (Unix; Intel) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+SOCIAL_PLATFORMS = ["facebook", "pinterest", "linkedin", "reddit", "twitter", "instagram"]
+CACHE_SIZE = 100  # Number of articles to keep in cache
+API_VERSION = "1.0.0"
 
-# Initialize NLP components with lazy loading
+# Cache for article processing
+article_cache = {}
+
+# Models
+class KeywordResponse(BaseModel):
+    keyword: str
+    score: float
+
+class EntityResponse(BaseModel):
+    type: str
+    text: str
+    
+class SentimentResponse(BaseModel):
+    compound: float
+    positive: float = Field(alias="pos")
+    negative: float = Field(alias="neg") 
+    neutral: float = Field(alias="neu")
+    
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="ignore",
+        json_schema_extra={
+            "example": {
+                "compound": 0.5,
+                "positive": 0.6,
+                "negative": 0.1,
+                "neutral": 0.3
+            }
+        }
+    )
+    
+class ArticleResponse(BaseModel):
+    title: str
+    date: Optional[datetime] = None
+    text: str
+    markdown: str
+    html: str
+    summary: str
+    keywords: List[KeywordResponse]
+    authors: List[str]
+    banner: Optional[str] = None
+    images: List[str]
+    entities: List[EntityResponse]
+    videos: List[str]
+    social_accounts: Dict[str, Any]
+    sentiment: SentimentResponse
+    accounts: Dict[str, Any]
+    social_shares: Dict[str, Any]
+    processing_time: float
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "title": "Sample Article",
+                "text": "This is the article text",
+                "markdown": "# Sample Article\n\nThis is the article text",
+                "html": "<h1>Sample Article</h1><p>This is the article text</p>",
+                "summary": "A summary of the article",
+                "keywords": [{"keyword": "sample", "score": 0.1}],
+                "authors": ["John Doe"],
+                "banner": "https://example.com/banner.jpg",
+                "images": ["https://example.com/image1.jpg"],
+                "entities": [{"type": "PERSON", "text": "John Doe"}],
+                "videos": ["https://example.com/video.mp4"],
+                "social_accounts": {},
+                "sentiment": {"compound": 0.5, "positive": 0.6, "negative": 0.1, "neutral": 0.3},
+                "accounts": {},
+                "social_shares": {},
+                "processing_time": 0.5
+            }
+        }
+    )
+
+class ArticleAction(BaseModel):
+    link: HttpUrl = Field(..., description="URL of the article to analyze")
+    cache: bool = Field(True, description="Whether to use cached results if available")
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "link": "https://example.com/article",
+                "cache": True
+            }
+        }
+    )
+
+class SummarizeAction(BaseModel):
+    text: str = Field(..., min_length=10, description="Text to summarize or extract tags from")
+    max_length: Optional[int] = Field(None, description="Maximum length of summary")
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "text": "This is a sample text for extracting keywords and analyzing sentiment.",
+                "max_length": 100
+            }
+        }
+    )
+
+class EntityFilterOptions(BaseModel):
+    exclude_types: List[str] = Field(
+        default_factory=lambda: list(EXCLUDED_ENTITY_TYPES),
+        description="Entity types to exclude"
+    )
+    min_length: int = Field(1, description="Minimum length of entity text")
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "exclude_types": ["DATE", "TIME"],
+                "min_length": 2
+            }
+        }
+    )
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    timestamp: str
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "status": "ok",
+                "version": "1.0.0",
+                "timestamp": "2023-01-01T12:00:00"
+            }
+        }
+    )
+
+# NLP Components with improved lazy loading
 class NLPComponents:
+    _instance = None
     _nlp = None
     _sentiment_analyzer = None
-    _kw_extractor = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(NLPComponents, cls).__new__(cls)
+        return cls._instance
     
     @property
     def nlp(self):
@@ -54,87 +194,56 @@ class NLPComponents:
             self._sentiment_analyzer = SentimentIntensityAnalyzer()
         return self._sentiment_analyzer
     
+    @lru_cache(maxsize=8)
     def get_keyword_extractor(self, language="en", n=1, dedup_lim=0.9, top=5):
-        """Get a configured YAKE keyword extractor"""
+        """Get a configured YAKE keyword extractor with caching"""
+        logger.info(f"Creating keyword extractor: lang={language}, n={n}, dedup={dedup_lim}, top={top}")
         return yake.KeywordExtractor(lan=language, n=n, dedupLim=dedup_lim, top=top)
 
-# Initialize global components
-nlp_components = NLPComponents()
 
-# Constants
-EXCLUDED_ENTITY_TYPES = {"TIME", "DATE", "LANGUAGE", "PERCENT", "MONEY", "QUANTITY", "ORDINAL", "CARDINAL"}
-STRIP_TEXT_RULES = ["a"]
-DEFAULT_USER_AGENT = "NLP/1.0.0 (Unix; Intel) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-SOCIAL_PLATFORMS = ["facebook", "pinterest", "linkedin", "reddit", "twitter", "instagram"]
-
-# Cache for article processing
-article_cache = {}
-
-# Request Models with enhanced validation
-class ArticleAction(BaseModel):
-    link: HttpUrl = Field(..., description="URL of the article to analyze")
-    cache: bool = Field(True, description="Whether to use cached results if available")
+# Lifespan manager for application startup and shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize NLP components on startup
+    logger.info("Initializing NLP components...")
+    components = NLPComponents()
+    # Pre-load models to avoid lazy loading during first request
+    _ = components.nlp
+    _ = components.sentiment_analyzer
+    logger.info("NLP API started successfully")
     
-    class Config:
-        schema_extra = {
-            "example": {
-                "link": "https://example.com/article",
-                "cache": True
-            }
-        }
-
-class SummarizeAction(BaseModel):
-    text: str = Field(..., min_length=10, description="Text to summarize or extract tags from")
-    max_length: Optional[int] = Field(None, description="Maximum length of summary")
+    yield
     
-    class Config:
-        schema_extra = {
-            "example": {
-                "text": "This is a sample text for extracting keywords and analyzing sentiment.",
-                "max_length": 100
-            }
-        }
+    # Cleanup on shutdown
+    logger.info("Shutting down NLP API")
+    # Clear cache
+    article_cache.clear()
 
-class EntityFilterOptions(BaseModel):
-    exclude_types: List[str] = Field(
-        default_factory=lambda: list(EXCLUDED_ENTITY_TYPES),
-        description="Entity types to exclude"
-    )
-    min_length: int = Field(1, description="Minimum length of entity text")
 
-# Response Models
-class KeywordResponse(BaseModel):
-    keyword: str
-    score: float
+# Initialize FastAPI app with lifespan manager
+app = FastAPI(
+    title="NLP API",
+    description="API for Natural Language Processing tasks including article analysis, sentiment analysis, entity extraction, and more.",
+    version=API_VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan,
+)
 
-class EntityResponse(BaseModel):
-    type: str
-    text: str
-    
-class SentimentResponse(BaseModel):
-    compound: float
-    positive: float
-    negative: float
-    neutral: float
-    
-class ArticleResponse(BaseModel):
-    title: str
-    date: Optional[datetime]
-    text: str
-    markdown: str
-    html: str
-    summary: str
-    keywords: List[KeywordResponse]
-    authors: List[str]
-    banner: Optional[str]
-    images: List[str]
-    entities: List[EntityResponse]
-    videos: List[str]
-    social_accounts: Dict[str, Any]
-    sentiment: SentimentResponse
-    accounts: Dict[str, Any]
-    social_shares: Dict[str, Any]
-    processing_time: float
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Set specific origins in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize the router
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["nlp"],
+)
 
 # Helper Functions
 def get_cache_key(url: str) -> str:
@@ -189,11 +298,12 @@ def extract_keywords(text: str, language="en", n=1, dedup_lim=0.9, top=5):
         return []
         
     try:
+        nlp_components = NLPComponents()
         extractor = nlp_components.get_keyword_extractor(
             language=language, n=n, dedup_lim=dedup_lim, top=top
         )
         keywords = extractor.extract_keywords(text)
-        return [{"keyword": kw, "score": score} for kw, score in keywords]
+        return [KeywordResponse(keyword=kw, score=score) for kw, score in keywords]
     except Exception as e:
         logger.error(f"Error extracting keywords: {str(e)}")
         return []
@@ -204,7 +314,7 @@ def filter_entities(doc, options: EntityFilterOptions = None):
         options = EntityFilterOptions()
         
     entities = [
-        {"type": ent.label_, "text": ent.text}
+        EntityResponse(type=ent.label_, text=ent.text)
         for ent in doc.ents
         if ent.label_ not in options.exclude_types and len(ent.text) >= options.min_length
     ]
@@ -213,7 +323,7 @@ def filter_entities(doc, options: EntityFilterOptions = None):
     seen = set()
     unique_entities = []
     for entity in entities:
-        key = (entity["type"], entity["text"].lower())
+        key = (entity.type, entity.text.lower())
         if key not in seen:
             seen.add(key)
             unique_entities.append(entity)
@@ -227,74 +337,146 @@ async def process_article_data(link: str):
     # Fetch article
     article = await fetch_article(link)
     
-    # Perform NLP processing
-    doc = nlp_components.nlp(article.text)
+    # Get NLP components
+    nlp_components = NLPComponents()
+    
+    # Process text in chunks if too large
+    text = article.text
+    doc = nlp_components.nlp(text[:500000]) if len(text) > 500000 else nlp_components.nlp(text)
+    
+    # Process all tasks concurrently
+    tasks = []
     
     # Extract entities
-    filtered_entities = filter_entities(doc)
+    entities_task = asyncio.create_task(asyncio.to_thread(
+        filter_entities, doc, EntityFilterOptions()
+    ))
+    tasks.append(entities_task)
     
     # Get social accounts
-    social_accounts = socials.extract(link).get_matches_per_platform()
+    social_accounts_task = asyncio.create_task(asyncio.to_thread(
+        lambda: socials.extract(link).get_matches_per_platform()
+    ))
+    tasks.append(social_accounts_task)
     
     # Get social shares
-    try:
-        social_shares = socialshares.fetch(link, SOCIAL_PLATFORMS)
-    except Exception as e:
-        logger.error(f"Error fetching social shares: {str(e)}")
-        social_shares = {}
+    social_shares_task = asyncio.create_task(asyncio.to_thread(
+        lambda: socialshares.fetch(link, SOCIAL_PLATFORMS)
+    ))
+    tasks.append(social_shares_task)
     
     # Sentiment analysis
-    sentiment_scores = nlp_components.sentiment_analyzer.polarity_scores(article.text)
+    sentiment_task = asyncio.create_task(asyncio.to_thread(
+        lambda: nlp_components.sentiment_analyzer.polarity_scores(text)
+    ))
+    tasks.append(sentiment_task)
     
     # Generate SpaCy HTML visualization
-    spacy_html = displacy.render(doc, style="ent", options={"ents": [e["type"] for e in filtered_entities]})
+    spacy_html_task = asyncio.create_task(asyncio.to_thread(
+        lambda: displacy.render(doc, style="ent")
+    ))
+    tasks.append(spacy_html_task)
     
     # Extract keywords
-    keywords = extract_keywords(article.text, top=5)
+    keywords_task = asyncio.create_task(asyncio.to_thread(
+        lambda: extract_keywords(text, top=5)
+    ))
+    tasks.append(keywords_task)
     
     # Extract potential accounts
+    accounts_task = asyncio.create_task(asyncio.to_thread(
+        lambda: socid_extractor.extract(text)
+    ))
+    tasks.append(accounts_task)
+    
     try:
-        accounts = socid_extractor.extract(article.text)
+        # Wait for all tasks to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results with error handling
+        filtered_entities = results[0] if not isinstance(results[0], Exception) else []
+        social_accounts = results[1] if not isinstance(results[1], Exception) else {}
+        social_shares = results[2] if not isinstance(results[2], Exception) else {}
+        sentiment_scores = results[3] if not isinstance(results[3], Exception) else {"compound": 0, "pos": 0, "neg": 0, "neu": 0}
+        spacy_html = results[4] if not isinstance(results[4], Exception) else ""
+        keywords = results[5] if not isinstance(results[5], Exception) else []
+        accounts = results[6] if not isinstance(results[6], Exception) else {}
+        
+        # Log any exceptions
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Task {i} failed: {result}")
+        
     except Exception as e:
-        logger.error(f"Error extracting accounts: {str(e)}")
+        logger.error(f"Error in concurrent processing: {str(e)}")
+        # Provide default values for failed tasks
+        filtered_entities = []
+        social_accounts = {}
+        social_shares = {}
+        sentiment_scores = {"compound": 0, "positive": 0, "negative": 0, "neutral": 0}
+        spacy_html = ""
+        keywords = []
         accounts = {}
     
     # Calculate processing time
     processing_time = time.time() - start_time
     
-    return {
-        "title": article.title,
-        "date": article.publish_date,
-        "text": article.text,
-        "markdown": md(article.article_html, newline_style="BACKSLASH", strip=STRIP_TEXT_RULES, heading_style="ATX"),
-        "html": article.article_html,
-        "summary": article.summary,
-        "keywords": keywords,
-        "authors": article.authors,
-        "banner": article.top_image,
-        "images": list(article.images),
-        "entities": filtered_entities,
-        "videos": list(article.movies),
-        "social_accounts": social_accounts,
-        "spacy_html": spacy_html,
-        "spacy_markdown": md(spacy_html, newline_style="BACKSLASH", strip=STRIP_TEXT_RULES, heading_style="ATX"),
-        "sentiment": sentiment_scores,
-        "accounts": accounts,
-        "social_shares": social_shares,
-        "processing_time": processing_time,
-    }
+    return ArticleResponse(
+        title=article.title,
+        date=article.publish_date,
+        text=article.text,
+        markdown=md(article.article_html, newline_style="BACKSLASH", strip=STRIP_TEXT_RULES, heading_style="ATX"),
+        html=article.article_html,
+        summary=article.summary,
+        keywords=keywords,
+        authors=article.authors,
+        banner=article.top_image,
+        images=list(article.images),
+        entities=filtered_entities,
+        videos=list(article.movies),
+        social_accounts=social_accounts,
+        sentiment=SentimentResponse(**sentiment_scores),
+        accounts=accounts,
+        social_shares=social_shares,
+        processing_time=processing_time,
+    )
 
-# Helper function to get a dependency that we can override for testing
+# Helper function to get entity filter options as a dependency
 async def get_entity_filter_options(
     exclude_types: List[str] = Query(default=list(EXCLUDED_ENTITY_TYPES)),
     min_length: int = Query(default=1),
 ):
     return EntityFilterOptions(exclude_types=exclude_types, min_length=min_length)
 
+# Cache management
+def manage_cache_size():
+    """Ensure cache doesn't exceed maximum size"""
+    if len(article_cache) > CACHE_SIZE:
+        # Remove oldest items
+        keys_to_remove = sorted(article_cache.keys(), key=lambda k: article_cache[k].get("timestamp", 0))[:len(article_cache) - CACHE_SIZE]
+        for key in keys_to_remove:
+            del article_cache[key]
+        logger.info(f"Cache cleaned up, removed {len(keys_to_remove)} items")
+
+# Background task to update article cache
+async def update_article_cache(url: str, cache_key: str):
+    """Update the cache for a given article URL"""
+    try:
+        logger.info(f"Updating cache for {url}")
+        result = await process_article_data(url)
+        article_cache[cache_key] = {
+            "data": result,
+            "timestamp": time.time()
+        }
+        manage_cache_size()
+        logger.info(f"Cache updated for {url}")
+    except Exception as e:
+        logger.error(f"Error updating cache for {url}: {str(e)}")
+
 # Routes
 @app.post(
-    "/nlp/article",
-    response_model=Dict[str, Any],
+    "/api/v1/nlp/article",
+    response_model=Dict[str, Union[ArticleResponse, bool]],
     status_code=status.HTTP_200_OK,
     summary="Process an article",
     description="Fetch and analyze an article using NLP techniques"
@@ -310,9 +492,13 @@ async def process_article(
         # Check cache if enabled
         if article.cache and cache_key in article_cache:
             logger.info(f"Using cached data for {article.link}")
-            result = article_cache[cache_key]
-            # Update the cache in the background
-            background_tasks.add_task(update_article_cache, str(article.link), cache_key)
+            cached_item = article_cache[cache_key]
+            result = cached_item.get("data")
+            
+            # Update the cache in the background if older than 1 hour
+            if time.time() - cached_item.get("timestamp", 0) > 3600:
+                background_tasks.add_task(update_article_cache, str(article.link), cache_key)
+                
             return {"data": result, "cached": True}
         
         # Process the article
@@ -320,7 +506,11 @@ async def process_article(
         result = await process_article_data(str(article.link))
         
         # Save to cache
-        article_cache[cache_key] = result
+        article_cache[cache_key] = {
+            "data": result,
+            "timestamp": time.time()
+        }
+        manage_cache_size()
         
         return {"data": result, "cached": False}
     except HTTPException as e:
@@ -334,7 +524,7 @@ async def process_article(
         )
 
 @app.post(
-    "/nlp/tags",
+    "/api/v1/nlp/tags",
     response_model=Dict[str, List[KeywordResponse]],
     status_code=status.HTTP_200_OK,
     summary="Extract tags from text",
@@ -342,7 +532,9 @@ async def process_article(
 )
 async def extract_tags(article: SummarizeAction):
     try:
-        keywords = extract_keywords(article.text, n=3, top=5)
+        keywords = await asyncio.to_thread(
+            extract_keywords, article.text, n=3, top=5
+        )
         return {"data": keywords}
     except Exception as e:
         logger.error(f"Error extracting tags: {str(e)}", exc_info=True)
@@ -352,7 +544,7 @@ async def extract_tags(article: SummarizeAction):
         )
 
 @app.post(
-    "/nlp/sentiment",
+    "/api/v1/nlp/sentiment",
     response_model=Dict[str, SentimentResponse],
     status_code=status.HTTP_200_OK,
     summary="Analyze sentiment",
@@ -360,8 +552,13 @@ async def extract_tags(article: SummarizeAction):
 )
 async def analyze_sentiment(article: SummarizeAction):
     try:
-        sentiment = nlp_components.sentiment_analyzer.polarity_scores(article.text)
-        return {"data": sentiment}
+        nlp_components = NLPComponents()
+        sentiment = await asyncio.to_thread(
+            nlp_components.sentiment_analyzer.polarity_scores, article.text
+        )
+        # VADER returns {'neg': 0.1, 'neu': 0.2, 'pos': 0.7, 'compound': 0.5}
+        # Our model expects field names: negative, neutral, positive, compound
+        return {"data": SentimentResponse(**sentiment)}
     except Exception as e:
         logger.error(f"Error analyzing sentiment: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -370,7 +567,7 @@ async def analyze_sentiment(article: SummarizeAction):
         )
 
 @app.post(
-    "/nlp/entities",
+    "/api/v1/nlp/entities",
     response_model=Dict[str, List[EntityResponse]],
     status_code=status.HTTP_200_OK,
     summary="Extract entities",
@@ -381,8 +578,16 @@ async def extract_entities(
     filter_options: EntityFilterOptions = Depends(get_entity_filter_options),
 ):
     try:
-        doc = nlp_components.nlp(article.text)
-        entities = filter_entities(doc, filter_options)
+        nlp_components = NLPComponents()
+        
+        # Process text in chunks if too large
+        if len(article.text) > 500000:
+            doc = await asyncio.to_thread(nlp_components.nlp, article.text[:500000])
+            logger.warning(f"Text too large ({len(article.text)} chars), truncated to 500K chars")
+        else:
+            doc = await asyncio.to_thread(nlp_components.nlp, article.text)
+            
+        entities = await asyncio.to_thread(filter_entities, doc, filter_options)
         return {"data": entities}
     except Exception as e:
         logger.error(f"Error extracting entities: {str(e)}", exc_info=True)
@@ -392,7 +597,7 @@ async def extract_entities(
         )
 
 @app.post(
-    "/nlp/summarize",
+    "/api/v1/nlp/summarize",
     response_model=Dict[str, str],
     status_code=status.HTTP_200_OK,
     summary="Summarize text",
@@ -400,12 +605,14 @@ async def extract_entities(
 )
 async def summarize_text(article: SummarizeAction):
     try:
-        # Create a temporary Article object for summarization
-        temp_article = Article(url='')
-        temp_article.set_text(article.text)
-        temp_article.nlp()
-        
-        summary = temp_article.summary
+        async def _summarize():
+            # Create a temporary Article object for summarization
+            temp_article = Article(url='')
+            temp_article.set_text(article.text)
+            temp_article.nlp()
+            return temp_article.summary
+            
+        summary = await asyncio.to_thread(_summarize)
         
         # Truncate if max_length is specified
         if article.max_length and len(summary) > article.max_length:
@@ -420,30 +627,21 @@ async def summarize_text(article: SummarizeAction):
         )
 
 @app.get(
-    "/nlp/health",
-    response_model=Dict[str, str],
+    "/api/v1/nlp/health",
+    response_model=HealthResponse,
     status_code=status.HTTP_200_OK,
     summary="API health check",
     description="Check if the NLP API is running correctly"
 )
 async def health_check():
-    return {
-        "status": "ok",
-        "version": "1.0.0",
-        "timestamp": datetime.now().isoformat()
-    }
+    return HealthResponse(
+        status="ok",
+        version=API_VERSION,
+        timestamp=datetime.now().isoformat()
+    )
 
-# Background task to update article cache
-async def update_article_cache(url: str, cache_key: str):
-    """Update the cache for a given article URL"""
-    try:
-        logger.info(f"Updating cache for {url}")
-        result = await process_article_data(url)
-        article_cache[cache_key] = result
-        logger.info(f"Cache updated for {url}")
-    except Exception as e:
-        logger.error(f"Error updating cache for {url}: {str(e)}")
-
+# Mount the router to the FastAPI app
+app.include_router(router)
 
 # If this module is run directly, start the app with uvicorn
 if __name__ == "__main__":
