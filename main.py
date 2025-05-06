@@ -28,10 +28,10 @@ logging.basicConfig(
 logger = logging.getLogger("nlp_api")
 
 # Initialize FastAPI Router with more detailed description
-router = APIRouter(
+app = APIRouter(
     prefix="/api/v1",
     tags=["nlp"],
-    responses={404: {"description": "Not found"}},
+    
 )
 
 # Initialize NLP components with lazy loading
@@ -65,7 +65,7 @@ nlp_components = NLPComponents()
 EXCLUDED_ENTITY_TYPES = {"TIME", "DATE", "LANGUAGE", "PERCENT", "MONEY", "QUANTITY", "ORDINAL", "CARDINAL"}
 STRIP_TEXT_RULES = ["a"]
 DEFAULT_USER_AGENT = "NLP/1.0.0 (Unix; Intel) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-SOCIAL_PLATFORMS = ["facebook", "pinterest", "linkedin", "reddit", "twitter"]
+SOCIAL_PLATFORMS = ["facebook", "pinterest", "linkedin", "reddit", "twitter", "instagram"]
 
 # Cache for article processing
 article_cache = {}
@@ -292,7 +292,7 @@ async def get_entity_filter_options(
     return EntityFilterOptions(exclude_types=exclude_types, min_length=min_length)
 
 # Routes
-@router.post(
+@app.post(
     "/nlp/article",
     response_model=Dict[str, Any],
     status_code=status.HTTP_200_OK,
@@ -333,7 +333,7 @@ async def process_article(
             detail=f"Error processing article: {str(e)}"
         )
 
-@router.post(
+@app.post(
     "/nlp/tags",
     response_model=Dict[str, List[KeywordResponse]],
     status_code=status.HTTP_200_OK,
@@ -351,7 +351,7 @@ async def extract_tags(article: SummarizeAction):
             detail=f"Error extracting tags: {str(e)}"
         )
 
-@router.post(
+@app.post(
     "/nlp/sentiment",
     response_model=Dict[str, SentimentResponse],
     status_code=status.HTTP_200_OK,
@@ -369,7 +369,7 @@ async def analyze_sentiment(article: SummarizeAction):
             detail=f"Error analyzing sentiment: {str(e)}"
         )
 
-@router.post(
+@app.post(
     "/nlp/entities",
     response_model=Dict[str, List[EntityResponse]],
     status_code=status.HTTP_200_OK,
@@ -391,7 +391,7 @@ async def extract_entities(
             detail=f"Error extracting entities: {str(e)}"
         )
 
-@router.post(
+@app.post(
     "/nlp/summarize",
     response_model=Dict[str, str],
     status_code=status.HTTP_200_OK,
@@ -419,7 +419,7 @@ async def summarize_text(article: SummarizeAction):
             detail=f"Error summarizing text: {str(e)}"
         )
 
-@router.get(
+@app.get(
     "/nlp/health",
     response_model=Dict[str, str],
     status_code=status.HTTP_200_OK,
