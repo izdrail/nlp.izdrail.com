@@ -112,6 +112,44 @@ class ArticleResponse(BaseModel):
         }
     )
 
+class CachedArticleResponse(BaseModel):
+    cache_key: str
+    cached_at: datetime
+    article: ArticleResponse
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "cache_key": "abc123def456",
+                "cached_at": "2023-12-01T12:00:00",
+                "article": {
+                    "title": "Sample Article",
+                    "text": "This is the article text",
+                    "processing_time": 0.5
+                }
+            }
+        }
+    )
+
+class CachedArticlesListResponse(BaseModel):
+    total_articles: int
+    articles: List[CachedArticleResponse]
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "total_articles": 10,
+                "articles": [
+                    {
+                        "cache_key": "abc123def456",
+                        "cached_at": "2023-12-01T12:00:00",
+                        "article": {"title": "Sample Article"}
+                    }
+                ]
+            }
+        }
+    )
+
 class ArticleAction(BaseModel):
     link: HttpUrl = Field(..., description="URL of the article to analyze")
     cache: bool = Field(True, description="Whether to use cached results if available")
@@ -521,6 +559,67 @@ async def process_article(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing article: {str(e)}"
+        )
+
+@app.get(
+    "/api/v1/nlp/articles/cached",
+    response_model=CachedArticlesListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get cached articles",
+    description="Retrieve all cached articles ordered by creation date (most recent first)"
+)
+async def get_cached_articles(
+    limit: int = Query(default=50, ge=1, le=500, description="Maximum number of articles to return"),
+    offset: int = Query(default=0, ge=0, description="Number of articles to skip")
+):
+    try:
+        # Convert cache to list of cached articles with metadata
+        cached_articles = []
+        
+        for cache_key, cached_item in article_cache.items():
+            article_data = cached_item.get("data")
+            timestamp = cached_item.get("timestamp", 0)
+            
+            if article_data:
+                # Use article date if available, otherwise use cache timestamp
+                creation_date = article_data.date if article_data.date else datetime.fromtimestamp(timestamp)
+                
+                cached_articles.append({
+                    "cache_key": cache_key,
+                    "cached_at": datetime.fromtimestamp(timestamp),
+                    "creation_date": creation_date,
+                    "article": article_data
+                })
+        
+        # Sort by creation date (article date or cache timestamp) in descending order
+        cached_articles.sort(key=lambda x: x["creation_date"] or x["cached_at"], reverse=True)
+        
+        # Apply pagination
+        total_articles = len(cached_articles)
+        paginated_articles = cached_articles[offset:offset + limit]
+        
+        # Format response
+        response_articles = [
+            CachedArticleResponse(
+                cache_key=item["cache_key"],
+                cached_at=item["cached_at"],
+                article=item["article"]
+            )
+            for item in paginated_articles
+        ]
+        
+        logger.info(f"Retrieved {len(response_articles)} cached articles (total: {total_articles})")
+        
+        return CachedArticlesListResponse(
+            total_articles=total_articles,
+            articles=response_articles
+        )
+        
+    except Exception as e:
+        logger.error(f"Error retrieving cached articles: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving cached articles: {str(e)}"
         )
 
 @app.post(
