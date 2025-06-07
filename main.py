@@ -581,18 +581,28 @@ async def get_cached_articles(
             timestamp = cached_item.get("timestamp", 0)
             
             if article_data:
-                # Use article date if available, otherwise use cache timestamp
-                creation_date = article_data.date if article_data.date else datetime.fromtimestamp(timestamp)
+                # Convert cache timestamp to datetime
+                cached_at = datetime.fromtimestamp(timestamp)
+                
+                # Handle article date - make it timezone-naive if it's timezone-aware
+                article_date = article_data.date
+                if article_date:
+                    # If the article date is timezone-aware, convert to naive
+                    if article_date.tzinfo is not None:
+                        article_date = article_date.replace(tzinfo=None)
+                    creation_date = article_date
+                else:
+                    creation_date = cached_at
                 
                 cached_articles.append({
                     "cache_key": cache_key,
-                    "cached_at": datetime.fromtimestamp(timestamp),
+                    "cached_at": cached_at,
                     "creation_date": creation_date,
                     "article": article_data
                 })
         
-        # Sort by creation date (article date or cache timestamp) in descending order
-        cached_articles.sort(key=lambda x: x["creation_date"] or x["cached_at"], reverse=True)
+        # Sort by creation date in descending order (most recent first)
+        cached_articles.sort(key=lambda x: x["creation_date"], reverse=True)
         
         # Apply pagination
         total_articles = len(cached_articles)
@@ -621,6 +631,8 @@ async def get_cached_articles(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving cached articles: {str(e)}"
         )
+
+
 
 @app.post(
     "/api/v1/nlp/tags",
